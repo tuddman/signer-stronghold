@@ -2186,6 +2186,7 @@ dependencies = [
  "alloy-signer",
  "async-trait",
  "iota_stronghold",
+ "thiserror",
 ]
 
 [[package]]
