@@ -11,6 +11,7 @@ const CLIENT_PATH: &[u8] = b"client-path-0";
 const VAULT_PATH: &[u8] = b"vault-path";
 const RECORD_PATH: &[u8] = b"record-path-0";
 
+#[derive(Clone)]
 pub struct StrongholdSigner {
     pub(crate) address: Address,
     pub(crate) chain_id: Option<ChainId>,
@@ -348,22 +349,115 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_integration_with_provider() {
+    async fn test_end_to_end_transaction_with_anvil() {
+        use alloy::network::EthereumWallet;
+        use alloy::node_bindings::Anvil;
+        use alloy::providers::{ext::AnvilApi, Provider, ProviderBuilder};
+        use alloy_primitives::U256;
+
+        // Setup temp stronghold
         let temp_file = setup_temp_stronghold();
         let path = temp_file.path().to_str().unwrap();
 
-        let signer = StrongholdSigner::new(Some(1)).unwrap();
-        //let provider = ProviderBuilder::new().on_anvil();
-        let address: Address = TxSigner::address(&signer);
+        // Create signer (chain_id 1 to match Anvil's default)
+        let signer = StrongholdSigner::new(Some(1)).expect("Failed to create signer");
+        let sender_address: Address = TxSigner::address(&signer);
+        let wallet = EthereumWallet::from(signer.clone());
 
-        // In a real test you would:
-        // 1. Fund the signer's address
-        // 2. Create and sign a transaction
-        // 3. Send it through the provider
-        // 4. Verify it was mined
+        // Start Anvil instance
+        let anvil = Anvil::new().spawn();
 
-        // This just verifies basic compatibility
-        assert_ne!(address, Address::ZERO);
+        // Create provider connected to Anvil
+        let provider = ProviderBuilder::new()
+            .wallet(wallet)
+            .on_http(anvil.endpoint_url());
+
+        provider
+            .anvil_set_balance(sender_address, U256::from(1_000_000_000))
+            .await
+            .unwrap();
+        // Fund the signer's address (Anvil starts with prefunded accounts)
+        let initial_balance = provider
+            .get_balance(sender_address)
+            .await
+            .expect("Failed to get balance");
+
+        assert!(initial_balance > U256::ZERO, "Signer should have balance");
+
+        // Create a transaction
+        let recipient = "deaddeaddeaddeaddeaddeaddeaddeaddeaddead";
+        let recipient: Address = recipient.parse().unwrap();
+        let tx_value = U256::from(100);
+        let gas_price = provider
+            .get_gas_price()
+            .await
+            .expect("Failed to get gas price");
+        let nonce = provider
+            .get_transaction_count(sender_address)
+            .await
+            .expect("Failed to get nonce");
+
+        let mut tx = TxLegacy {
+            to: alloy::primitives::TxKind::Call(recipient),
+            value: tx_value,
+            gas_price,
+            gas_limit: 21000,
+            input: bytes!(""),
+            nonce,
+            ..Default::default()
+        };
+
+        // Sign the transaction
+        let signature = signer
+            .sign_transaction(&mut tx)
+            .await
+            .expect("Failed to sign tx");
+        let signed_tx = tx.into_signed(signature);
+
+        // Encode the signed transaction to RLP bytes
+        let mut tx_bytes = Vec::new();
+        signed_tx.rlp_encode(&mut tx_bytes);
+
+        // Send the transaction
+        let tx_hash = provider
+            .send_raw_transaction(&tx_bytes)
+            .await
+            .unwrap()
+            .watch()
+            .await
+            .expect("Failed to send tx");
+
+        // Wait for transaction to be mined
+        let receipt = provider
+            .get_transaction_receipt(tx_hash)
+            .await
+            .expect("Failed to get receipt")
+            .expect("Receipt not found (tx not mined)");
+
+        assert!(receipt.status(), "Tx should be successful");
+
+        // Verify balances
+        let sender_balance = provider
+            .get_balance(sender_address)
+            .await
+            .expect("Failed to get sender balance");
+        let recipient_balance = provider
+            .get_balance(recipient)
+            .await
+            .expect("Failed to get recipient balance");
+
+        //// Calculate expected values (very simplified - doesn't account for gas properly)
+        //let expected_sender_balance = initial_balance - tx_value - (gas_price * 21000);
+        //let expected_recipient_balance = tx_value;
+        //
+        //assert!(
+        //    sender_balance < initial_balance,
+        //    "Sender balance should decrease"
+        //);
+        //assert!(
+        //    recipient_balance >= expected_recipient_balance,
+        //    "Recipient should receive funds"
+        //);
 
         cleanup_temp_stronghold(path);
     }
