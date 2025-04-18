@@ -11,3 +11,8 @@ alloy-signer = "0.14.0"
 async-trait = "0.1.88"
 iota_stronghold = "2.1.0"
 thiserror = "2.0"
+
+[dev-dependencies]
+alloy = { version = "0.14.0", features = ["providers"] }
+tempfile = "3.19.1"
+tokio = "1.44.2"

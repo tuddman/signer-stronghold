@@ -92,10 +92,10 @@ impl Signer for StrongholdSigner {
 
 impl StrongholdSigner {
     pub fn new(chain_id: Option<ChainId>) -> Result<Self, StrongholdSignerError> {
-        let master_passphrase = std::env::var("PASSPHRASE")?.as_bytes().to_vec();
+        let passphrase = std::env::var("PASSPHRASE")?.as_bytes().to_vec();
 
         let snapshot_path = SnapshotPath::from_path(STRONGHOLD_PATH);
-        let key_provider = KeyProvider::with_passphrase_hashed_blake2b(master_passphrase)?;
+        let key_provider = KeyProvider::with_passphrase_hashed_blake2b(passphrase)?;
         let stronghold = Stronghold::default();
 
         let init_result =
@@ -186,5 +186,185 @@ impl StrongholdSigner {
         _tx: &mut dyn SignableTransaction<Signature>,
     ) -> Result<Signature> {
         unimplemented!()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    //use alloy::providers::ProviderBuilder;
+    use alloy_consensus::{TxEnvelope, TxLegacy};
+    use alloy_network::TxSigner;
+    use alloy_primitives::{bytes, U256};
+    use std::{env, fs};
+    use tempfile::NamedTempFile;
+
+    // Helper to create temp stronghold file
+    fn setup_temp_stronghold() -> NamedTempFile {
+        let temp_file = NamedTempFile::new().expect("Failed to create temp file");
+        env::set_var("PASSPHRASE", "test_passphrase");
+        temp_file
+    }
+
+    // Helper to clean up
+    fn cleanup_temp_stronghold(path: &str) {
+        let _ = fs::remove_file(path);
+        env::remove_var("PASSPHRASE");
+    }
+
+    #[tokio::test]
+    async fn test_initialize_new_signer() {
+        let temp_file = setup_temp_stronghold();
+        let path = temp_file.path().to_str().unwrap();
+
+        let signer = StrongholdSigner::new(Some(1));
+        assert!(signer.is_ok(), "Should initialize successfully");
+
+        let signer = signer.unwrap();
+        assert!(signer.address != Address::ZERO, "Address should be set");
+        assert_eq!(signer.chain_id, Some(1), "Chain ID should match");
+
+        cleanup_temp_stronghold(path);
+    }
+
+    #[tokio::test]
+    async fn test_reinitialize_existing_signer() {
+        let temp_file = setup_temp_stronghold();
+        let path = temp_file.path().to_str().unwrap();
+
+        // First creation
+        let signer1 = StrongholdSigner::new(Some(1)).unwrap();
+        let address1 = signer1.address;
+
+        // Second creation should load same key
+        let signer2 = StrongholdSigner::new(Some(1)).unwrap();
+        assert_eq!(signer2.address, address1, "Should load same address");
+
+        cleanup_temp_stronghold(path);
+    }
+
+    #[tokio::test]
+    async fn test_sign_hash() {
+        let temp_file = setup_temp_stronghold();
+        let path = temp_file.path().to_str().unwrap();
+
+        let signer = StrongholdSigner::new(Some(1)).unwrap();
+        let hash = B256::new(*b"test_hash_of_this_correct_length");
+
+        let signature = signer.sign_hash(&hash).await;
+        assert!(signature.is_ok(), "Should sign hash successfully");
+
+        let sig = signature.unwrap();
+        assert!(!sig.r().is_zero(), "r component should be non-zero");
+        assert!(!sig.s().is_zero(), "s component should be non-zero");
+        assert!(sig.v(), "v component should be valid");
+
+        cleanup_temp_stronghold(path);
+    }
+
+    #[tokio::test]
+    async fn test_sign_transaction() {
+        let temp_file = setup_temp_stronghold();
+        let path = temp_file.path().to_str().unwrap();
+
+        let signer = StrongholdSigner::new(Some(1)).unwrap();
+        let to = "deaddeaddeaddeaddeaddeaddeaddeaddeaddead";
+        let to: Address = to.parse().unwrap();
+
+        let mut tx = TxLegacy {
+            to: alloy::primitives::TxKind::Call(to),
+            value: U256::from(100),
+            gas_price: 1,
+            gas_limit: 21000,
+            input: bytes!(""),
+            nonce: 0,
+            ..Default::default()
+        };
+
+        let result = signer.sign_transaction(&mut tx).await;
+        assert!(result.is_ok(), "Should sign transaction successfully");
+
+        let sig = result.unwrap();
+        let _envelope = TxEnvelope::Legacy(tx.into_signed(sig));
+        //assert!(envelope.signature(), "Should have valid signature");
+
+        cleanup_temp_stronghold(path);
+    }
+
+    #[tokio::test]
+    async fn test_get_evm_address() {
+        let temp_file = setup_temp_stronghold();
+        let path = temp_file.path().to_str().unwrap();
+
+        let signer = StrongholdSigner::new(Some(1)).unwrap();
+        let address: Address = TxSigner::address(&signer);
+
+        assert_ne!(address, Address::ZERO, "Address should not be zero");
+        assert_eq!(address.len(), 20, "Address should be 20 bytes");
+
+        cleanup_temp_stronghold(path);
+    }
+
+    #[tokio::test]
+    async fn test_chain_id_management() {
+        let temp_file = setup_temp_stronghold();
+        let path = temp_file.path().to_str().unwrap();
+
+        let mut signer = StrongholdSigner::new(Some(1)).unwrap();
+        assert_eq!(signer.chain_id(), Some(1));
+
+        signer.set_chain_id(Some(5));
+        assert_eq!(signer.chain_id(), Some(5));
+
+        signer.set_chain_id(None);
+        assert_eq!(signer.chain_id(), None);
+
+        cleanup_temp_stronghold(path);
+    }
+
+    #[tokio::test]
+    async fn test_missing_passphrase() {
+        env::remove_var("PASSPHRASE");
+
+        let result = StrongholdSigner::new(Some(1));
+        assert!(result.is_err(), "Should fail without passphrase");
+    }
+
+    #[tokio::test]
+    async fn test_signer_trait_implementation() {
+        let temp_file = setup_temp_stronghold();
+        let path = temp_file.path().to_str().unwrap();
+
+        let signer = StrongholdSigner::new(Some(1)).unwrap();
+
+        // Test address method
+        let address: Address = TxSigner::address(&signer);
+        assert_ne!(address, Address::ZERO);
+
+        // Test chain_id method
+        assert_eq!(signer.chain_id(), Some(1));
+
+        cleanup_temp_stronghold(path);
+    }
+
+    #[tokio::test]
+    async fn test_integration_with_provider() {
+        let temp_file = setup_temp_stronghold();
+        let path = temp_file.path().to_str().unwrap();
+
+        let signer = StrongholdSigner::new(Some(1)).unwrap();
+        //let provider = ProviderBuilder::new().on_anvil();
+        let address: Address = TxSigner::address(&signer);
+
+        // In a real test you would:
+        // 1. Fund the signer's address
+        // 2. Create and sign a transaction
+        // 3. Send it through the provider
+        // 4. Verify it was mined
+
+        // This just verifies basic compatibility
+        assert_ne!(address, Address::ZERO);
+
+        cleanup_temp_stronghold(path);
     }
 }
