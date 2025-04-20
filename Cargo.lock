@@ -2287,6 +2287,7 @@ dependencies = [
  "once_cell",
  "serdect",
  "sha2",
+ "signature",
 ]
 
 [[package]]
@@ -3465,7 +3466,9 @@ dependencies = [
  "alloy-primitives",
  "alloy-signer",
  "async-trait",
+ "iota-crypto",
  "iota_stronghold",
+ "k256",
  "tempfile",
  "thiserror 2.0.12",
  "tokio",

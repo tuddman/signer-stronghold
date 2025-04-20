@@ -6,10 +6,12 @@ edition = "2021"
 [dependencies]
 alloy-consensus = "0.14.0"
 alloy-network = "0.14.0"
-alloy-primitives = "1.0.0"
+alloy-primitives = { version = "1.0.0", features = ["k256"] }
 alloy-signer = "0.14.0"
 async-trait = "0.1.88"
+iota-crypto = { version = "0.23.2", features = ["secp256k1"] }
 iota_stronghold = "2.1.0"
+k256 = "0.13.4"
 thiserror = "2.0"
 
 [dev-dependencies]
