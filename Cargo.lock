@@ -3469,7 +3469,6 @@ dependencies = [
  "iota-crypto",
  "iota_stronghold",
  "k256",
- "tempfile",
  "thiserror 2.0.12",
  "tokio",
 ]

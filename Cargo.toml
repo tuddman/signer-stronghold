@@ -16,5 +16,4 @@ thiserror = "2.0"
 
 [dev-dependencies]
 alloy = { version = "0.14.0", features = ["node-bindings", "providers"] }
-tempfile = "3.19.1"
 tokio = "1.44.2"
