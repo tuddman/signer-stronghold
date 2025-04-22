@@ -9,12 +9,11 @@ alloy-network = "0.14.0"
 alloy-primitives = { version = "1.0.0", features = ["k256"] }
 alloy-signer = "0.14.0"
 async-trait = "0.1.88"
-iota-crypto = { version = "0.23.2", features = ["secp256k1"] }
 iota_stronghold = "2.1.0"
 k256 = { version = "0.13.4", features = ["ecdsa"] }
-spki = { version = "0.7.3", features = ["std"] }
 thiserror = "2.0"
 
 [dev-dependencies]
 alloy = { version = "0.14.0", features = ["node-bindings", "providers"] }
+alloy-network = "0.14.0"
 tokio = "1.44.2"

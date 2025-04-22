@@ -4,7 +4,6 @@ use alloy_consensus::SignableTransaction;
 use alloy_primitives::{hex, utils::eip191_message, Address, ChainId, Signature, B256};
 use alloy_signer::{sign_transaction_with_chain_id, Result, Signer};
 use async_trait::async_trait;
-use crypto::signatures::secp256k1_ecdsa::RecoverableSignature;
 use iota_stronghold::{procedures::KeyType, KeyProvider, Location, SnapshotPath, Stronghold};
 
 const STRONGHOLD_PATH: &str = "signer.stronghold";
@@ -41,9 +40,6 @@ pub enum StrongholdSignerError {
     /// [`alloy_primitives::SignatureError`] error.
     #[error(transparent)]
     Signature(#[from] alloy_primitives::SignatureError),
-    /// [`spki`] error.
-    #[error(transparent)]
-    Spki(#[from] spki::Error),
     /// [`iota_stronghold::procedures::ProcedureError`] error.
     #[error(transparent)]
     Procedure(#[from] iota_stronghold::procedures::ProcedureError),
@@ -56,9 +52,6 @@ pub enum StrongholdSignerError {
     /// Invalid signature.
     #[error("invalid signature: {0}")]
     InvalidSignature(String),
-    /// Unsupported operation.
-    #[error(transparent)]
-    UnsupportedOperation(#[from] alloy_signer::Error),
     /// Invalid signature bytes.
     #[error("invalid signature bytes: {0}")]
     InvalidSignatureBytes(String),
@@ -87,10 +80,13 @@ impl alloy_network::TxSigner<Signature> for StrongholdSigner {
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl Signer for StrongholdSigner {
     #[inline]
-    async fn sign_hash(&self, _hash: &B256) -> Result<Signature> {
-        return Err(alloy_signer::Error::UnsupportedOperation(
-            alloy_signer::UnsupportedSignerOperation::SignHash,
-        ));
+    async fn sign_hash(&self, hash: &B256) -> Result<Signature> {
+        let prefixed_msg = eip191_message(hash);
+        let sig = self
+            .sign_message_using_stronghold(&prefixed_msg)
+            .await
+            .map_err(alloy_signer::Error::other)?;
+        Ok(sig)
     }
 
     #[inline]
@@ -125,6 +121,8 @@ impl StrongholdSigner {
     /// Create a new StrongholdSigner with an optional chain ID.
     ///
     /// This will read the passphrase from the `PASSPHRASE` environment variable.
+    /// This passphrase should be treated with the same level of security as a private key.
+    ///
     /// If the stronghold snapshot file doesn't exist, it will create a new key.
     pub fn new(chain_id: Option<ChainId>) -> Result<Self, StrongholdSignerError> {
         let passphrase = std::env::var("PASSPHRASE")?.as_bytes().to_vec();
@@ -230,7 +228,7 @@ impl StrongholdSigner {
         let location = Location::const_generic(VAULT_PATH.to_vec(), RECORD_PATH.to_vec());
 
         // Sign the message using the Stronghold secp256k1 ECDSA procedure
-        let result_bytes: [u8; RecoverableSignature::LENGTH] =
+        let result_bytes: [u8; 65] =
             client.execute_procedure(iota_stronghold::procedures::Secp256k1EcdsaSign {
                 flavor: iota_stronghold::procedures::Secp256k1EcdsaFlavor::Keccak256,
                 msg: message.to_vec(),
@@ -319,21 +317,29 @@ mod tests {
     async fn test_sign_hash() {
         let signer = setup_test_env(Some(1));
 
-        let message = alloy::primitives::keccak256(b"hello world");
-        let signature = signer
-            .sign_hash(&message)
-            .await
-            .expect("Failed to sign hash");
+        println!("Signer: {:?}", signer);
         let signer_address = alloy_network::TxSigner::address(&signer);
-
-        assert!(!signature.r().is_zero(), "r component should be non-zero");
-        assert!(!signature.s().is_zero(), "s component should be non-zero");
+        println!("Signer address: {:?}", signer_address);
+        let message = b"hello world";
+        let hash = alloy::primitives::keccak256(message);
+        let signature = signer
+            .sign_hash(&hash)
+            .await
+            .expect("Failed to sign message");
 
         // Recover address from the signature
         let recovered = signature
-            .recover_address_from_msg(message)
+            .recover_address_from_msg(hash)
             .expect("Failed to recover address");
         assert_eq!(signer_address, recovered);
+
+        let recovered_from_hash = signature
+            .recover_address_from_prehash(&hash)
+            .expect("Failed to recover address");
+        // This is a misleading to test to conduct, as the hash is signed as though it is a
+        // message.  Effectively, keccak256(keccak256(message)) is signed. Which does not result in
+        // a reversible signature.
+        assert_ne!(signer_address, recovered_from_hash);
 
         cleanup_test_env();
     }
@@ -426,16 +432,17 @@ mod tests {
         use alloy::providers::{ext::AnvilApi, Provider, ProviderBuilder};
         use alloy_primitives::U256;
 
-        let signer = setup_test_env(Some(1));
+        // Start Anvil instance
+        let anvil = Anvil::new().spawn();
+        let chain_id = anvil.chain_id();
+
+        let signer = setup_test_env(Some(chain_id));
 
         let sender_address: Address = TxSigner::address(&signer);
         let wallet = EthereumWallet::from(signer.clone());
         println!("Signer        : {:?}", signer);
         println!("Sender address: {:?}", sender_address);
         println!("Wallet        : {:?}", wallet);
-
-        // Start Anvil instance
-        let anvil = Anvil::new().spawn();
 
         // Create provider connected to Anvil
         let provider = ProviderBuilder::new()
@@ -469,12 +476,12 @@ mod tests {
 
         let mut tx = TxLegacy {
             to: alloy::primitives::TxKind::Call(recipient),
+            chain_id: Some(chain_id),
             value: tx_value,
             gas_price,
             gas_limit: 21000,
             input: bytes!(""),
             nonce,
-            ..Default::default()
         };
 
         // Sign the transaction

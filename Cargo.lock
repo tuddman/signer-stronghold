@@ -3466,10 +3466,8 @@ dependencies = [
  "alloy-primitives",
  "alloy-signer",
  "async-trait",
- "iota-crypto",
  "iota_stronghold",
  "k256",
- "spki",
  "thiserror 2.0.12",
  "tokio",
 ]
