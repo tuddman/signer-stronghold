@@ -1,12 +1,11 @@
 use std::fmt;
 
 use alloy_consensus::SignableTransaction;
-use alloy_primitives::{hex, Address, ChainId, Signature, B256};
-use alloy_signer::{sign_transaction_with_chain_id, Result,  Signer};
+use alloy_primitives::{hex, utils::eip191_message, Address, ChainId, Signature, B256};
+use alloy_signer::{sign_transaction_with_chain_id, Result, Signer};
 use async_trait::async_trait;
 use crypto::signatures::secp256k1_ecdsa::RecoverableSignature;
 use iota_stronghold::{procedures::KeyType, KeyProvider, Location, SnapshotPath, Stronghold};
-use k256::ecdsa::{self, VerifyingKey};
 
 const STRONGHOLD_PATH: &str = "signer.stronghold";
 const CLIENT_PATH: &[u8] = b"client-path-0";
@@ -96,7 +95,11 @@ impl Signer for StrongholdSigner {
 
     #[inline]
     async fn sign_message(&self, message: &[u8]) -> Result<Signature> {
-        let sig = self.sign_message_using_stronghold(message).await.map_err(alloy_signer::Error::other)?;
+        let prefixed_msg = eip191_message(message);
+        let sig = self
+            .sign_message_using_stronghold(&prefixed_msg)
+            .await
+            .map_err(alloy_signer::Error::other)?;
         Ok(sig)
     }
 
@@ -149,7 +152,6 @@ impl StrongholdSigner {
             }
             _ => Self::get_evm_address(&stronghold)?,
         };
-
 
         Ok(Self {
             address,
@@ -216,20 +218,6 @@ impl StrongholdSigner {
         Ok(result.into())
     }
 
-    /// Gets the Verifying Key from the Stronghold client.
-    fn get_verifying_key(stronghold: &Stronghold) -> Result<VerifyingKey, StrongholdSignerError> {
-        let client = stronghold.get_client(CLIENT_PATH)?;
-        let private_key = Location::const_generic(VAULT_PATH.to_vec(), RECORD_PATH.to_vec());
-        let result = client.execute_procedure(iota_stronghold::procedures::PublicKey {
-            private_key,
-            ty: KeyType::Secp256k1Ecdsa,
-        })?;
-
-        let spki = spki::SubjectPublicKeyInfoRef::try_from(result.as_ref())?;
-        let key = VerifyingKey::from_sec1_bytes(spki.subject_public_key.raw_bytes())?;
-        Ok(key)
-    }
-
     /// Sign a message using the Stronghold client.
     /// The private key is never exposed outside of Stronghold's secure enclave.
     ///
@@ -249,48 +237,15 @@ impl StrongholdSigner {
                 private_key: location.clone(),
             })?;
 
-        let rid = k256::ecdsa::RecoveryId::from_byte(result_bytes[64]).ok_or(StrongholdSignerError::InvalidSignatureBytes(hex::encode(result_bytes)))?;
-        let sig = k256::ecdsa::Signature::from_slice(&result_bytes[..64]).map_err(StrongholdSignerError::K256Error)?;
-
+        let sig = k256::ecdsa::Signature::from_slice(&result_bytes[..64])
+            .map_err(StrongholdSignerError::K256Error)?;
+        let rid = k256::ecdsa::RecoveryId::from_byte(result_bytes[64]).ok_or(
+            StrongholdSignerError::InvalidSignatureBytes(hex::encode(result_bytes)),
+        )?;
 
         let signature = Signature::from((sig, rid));
         Ok(signature)
     }
-}
-
-/// Recover an rsig from a signature under a known key by trial/error.
-fn sig_from_digest_bytes_trial_recovery(
-    sig: k256::ecdsa::Signature,
-    hash: &B256,
-    pubkey: &VerifyingKey,
-) -> Signature {
-    let signature = Signature::from_signature_and_parity(sig, false);
-    if check_candidate(&signature, hash, pubkey) {
-        return signature;
-    }
-
-    let signature = signature.with_parity(true);
-    if check_candidate(&signature, hash, pubkey) {
-        return signature;
-    }
-
-    panic!("bad sig");
-}
-
-/// Makes a trial recovery to check whether an RSig corresponds to a known `VerifyingKey`.
-fn check_candidate(signature: &Signature, hash: &B256, pubkey: &VerifyingKey) -> bool {
-    signature
-        .recover_from_prehash(hash)
-        .map(|key| key == *pubkey)
-        .unwrap_or(false)
-}
-
-/// Decode an Stronghold Signature response.
-fn decode_signature(
-    raw: [u8; RecoverableSignature::LENGTH],
-) -> Result<k256::ecdsa::Signature, StrongholdSignerError> {
-    let sig = k256::ecdsa::Signature::from_der(&raw[..64])?;
-    Ok(sig.normalize_s().unwrap_or(sig))
 }
 
 #[cfg(test)]
