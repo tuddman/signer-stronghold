@@ -12,6 +12,7 @@ async-trait = "0.1.88"
 iota-crypto = { version = "0.23.2", features = ["secp256k1"] }
 iota_stronghold = "2.1.0"
 k256 = { version = "0.13.4", features = ["ecdsa"] }
+spki = { version = "0.7.3", features = ["std"] }
 thiserror = "2.0"
 
 [dev-dependencies]

@@ -1,24 +1,24 @@
 use std::fmt;
 
 use alloy_consensus::SignableTransaction;
-use alloy_primitives::{hex, Address, ChainId, B256, Signature};
-use alloy_signer::{sign_transaction_with_chain_id, Result, Signer};
+use alloy_primitives::{hex, Address, ChainId, Signature, B256};
+use alloy_signer::{sign_transaction_with_chain_id, Result,  Signer};
 use async_trait::async_trait;
 use crypto::signatures::secp256k1_ecdsa::RecoverableSignature;
-use iota_stronghold::{
-    procedures::{KeyType, PublicKey as PublickKeyProcedure},
-    KeyProvider, Location, SnapshotPath, Stronghold,
-};
+use iota_stronghold::{procedures::KeyType, KeyProvider, Location, SnapshotPath, Stronghold};
+use k256::ecdsa::{self, VerifyingKey};
 
 const STRONGHOLD_PATH: &str = "signer.stronghold";
 const CLIENT_PATH: &[u8] = b"client-path-0";
 const VAULT_PATH: &[u8] = b"vault-path";
 const RECORD_PATH: &[u8] = b"record-path-0";
 
+/// StrongholdSigner uses the Stronghold vault as the secure backing for an Ethereum Signer.
+///
 #[derive(Clone)]
 pub struct StrongholdSigner {
-    pub(crate) address: Address,
-    pub(crate) chain_id: Option<ChainId>,
+    address: Address,
+    chain_id: Option<ChainId>,
     stronghold: iota_stronghold::Stronghold,
 }
 
@@ -33,18 +33,39 @@ impl fmt::Debug for StrongholdSigner {
 
 #[derive(Debug, thiserror::Error)]
 pub enum StrongholdSignerError {
+    /// [`hex`] error.
     #[error(transparent)]
     Hex(#[from] hex::FromHexError),
+    /// [`iota_stronghold::types::ClientError`] error.
     #[error(transparent)]
     Client(#[from] iota_stronghold::types::ClientError),
+    /// [`alloy_primitives::SignatureError`] error.
     #[error(transparent)]
     Signature(#[from] alloy_primitives::SignatureError),
+    /// [`spki`] error.
+    #[error(transparent)]
+    Spki(#[from] spki::Error),
+    /// [`iota_stronghold::procedures::ProcedureError`] error.
     #[error(transparent)]
     Procedure(#[from] iota_stronghold::procedures::ProcedureError),
+    /// [`std::env::VarError`] error.
     #[error(transparent)]
     Var(#[from] std::env::VarError),
+    /// Invalid recovery value.
     #[error("invalid recovery value: {0}")]
     InvalidRecoveryValue(u8),
+    /// Invalid signature.
+    #[error("invalid signature: {0}")]
+    InvalidSignature(String),
+    /// Unsupported operation.
+    #[error(transparent)]
+    UnsupportedOperation(#[from] alloy_signer::Error),
+    /// Invalid signature bytes.
+    #[error("invalid signature bytes: {0}")]
+    InvalidSignatureBytes(String),
+    /// k256::ecdsa::Error
+    #[error(transparent)]
+    K256Error(#[from] k256::ecdsa::Error),
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -67,11 +88,16 @@ impl alloy_network::TxSigner<Signature> for StrongholdSigner {
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl Signer for StrongholdSigner {
     #[inline]
-    async fn sign_hash(&self, hash: &B256) -> Result<Signature> {
-        let msg = hash.as_slice();
-        self.sign_message_using_stronghold(msg)
-            .await
-            .map_err(alloy_signer::Error::other)
+    async fn sign_hash(&self, _hash: &B256) -> Result<Signature> {
+        return Err(alloy_signer::Error::UnsupportedOperation(
+            alloy_signer::UnsupportedSignerOperation::SignHash,
+        ));
+    }
+
+    #[inline]
+    async fn sign_message(&self, message: &[u8]) -> Result<Signature> {
+        let sig = self.sign_message_using_stronghold(message).await.map_err(alloy_signer::Error::other)?;
+        Ok(sig)
     }
 
     #[inline]
@@ -124,6 +150,7 @@ impl StrongholdSigner {
             _ => Self::get_evm_address(&stronghold)?,
         };
 
+
         Ok(Self {
             address,
             chain_id,
@@ -137,7 +164,6 @@ impl StrongholdSigner {
         chain_id: Option<ChainId>,
     ) -> Result<Self, StrongholdSignerError> {
         let address = Self::get_evm_address(&stronghold)?;
-        
         Ok(Self {
             address,
             chain_id,
@@ -184,11 +210,24 @@ impl StrongholdSigner {
     fn get_evm_address(stronghold: &Stronghold) -> Result<Address, StrongholdSignerError> {
         let client = stronghold.get_client(CLIENT_PATH)?;
         let private_key = Location::const_generic(VAULT_PATH.to_vec(), RECORD_PATH.to_vec());
-        let result = client.execute_procedure(iota_stronghold::procedures::GetEvmAddress {
-            private_key
-        })?;
+        let result =
+            client.execute_procedure(iota_stronghold::procedures::GetEvmAddress { private_key })?;
 
         Ok(result.into())
+    }
+
+    /// Gets the Verifying Key from the Stronghold client.
+    fn get_verifying_key(stronghold: &Stronghold) -> Result<VerifyingKey, StrongholdSignerError> {
+        let client = stronghold.get_client(CLIENT_PATH)?;
+        let private_key = Location::const_generic(VAULT_PATH.to_vec(), RECORD_PATH.to_vec());
+        let result = client.execute_procedure(iota_stronghold::procedures::PublicKey {
+            private_key,
+            ty: KeyType::Secp256k1Ecdsa,
+        })?;
+
+        let spki = spki::SubjectPublicKeyInfoRef::try_from(result.as_ref())?;
+        let key = VerifyingKey::from_sec1_bytes(spki.subject_public_key.raw_bytes())?;
+        Ok(key)
     }
 
     /// Sign a message using the Stronghold client.
@@ -201,72 +240,75 @@ impl StrongholdSigner {
     ) -> Result<Signature, StrongholdSignerError> {
         let client = self.stronghold.get_client(CLIENT_PATH)?;
         let location = Location::const_generic(VAULT_PATH.to_vec(), RECORD_PATH.to_vec());
-        
+
         // Sign the message using the Stronghold secp256k1 ECDSA procedure
-        let result: [u8; RecoverableSignature::LENGTH] =
+        let result_bytes: [u8; RecoverableSignature::LENGTH] =
             client.execute_procedure(iota_stronghold::procedures::Secp256k1EcdsaSign {
                 flavor: iota_stronghold::procedures::Secp256k1EcdsaFlavor::Keccak256,
                 msg: message.to_vec(),
                 private_key: location.clone(),
             })?;
 
-        // Convert the IOTA signature format to Alloy Signature format
-        let signature = convert_iota_bytes_to_alloy_sig(&result)?;
+        let rid = k256::ecdsa::RecoveryId::from_byte(result_bytes[64]).ok_or(StrongholdSignerError::InvalidSignatureBytes(hex::encode(result_bytes)))?;
+        let sig = k256::ecdsa::Signature::from_slice(&result_bytes[..64]).map_err(StrongholdSignerError::K256Error)?;
+
+
+        let signature = Signature::from((sig, rid));
         Ok(signature)
     }
 }
 
-/// Converts an IOTA Stronghold signature to an alloy_primitives::Signature
-///
-/// IOTA's RecoverableSignature has the form [r (32 bytes) | s (32 bytes) | v (1 byte)]
-/// where v is either 0 or 1 (the parity of the y coordinate).
-///
-/// For Ethereum, the recovery ID (v) needs to be either 27 or 28 for non-EIP155 signatures.
-fn convert_iota_bytes_to_alloy_sig(
-    iota_bytes: &[u8; RecoverableSignature::LENGTH],
-) -> Result<Signature, StrongholdSignerError> {
-    // Extract r, s, and v values
-    let r = &iota_bytes[0..32];
-    let s = &iota_bytes[32..64];
-    let v = iota_bytes[64];
-    
-    // Convert IOTA's v (0 or 1) to Ethereum's v (27 or 28)
-    let v_eth = match v {
-        0 => 27,
-        1 => 28,
-        27 | 28 => v, // Already in Ethereum format
-        _ => return Err(StrongholdSignerError::InvalidRecoveryValue(v)),
-    };
-    
-    // Create a standard 65-byte Ethereum signature
-    let mut sig_bytes = [0u8; 65];
-    sig_bytes[..32].copy_from_slice(r);
-    sig_bytes[32..64].copy_from_slice(s);
-    sig_bytes[64] = v_eth;
-    
-    // Use alloy_primitives to create a Signature
-    let signature = Signature::try_from(sig_bytes.as_ref())
-        .map_err(|e| StrongholdSignerError::Signature(e))?;
-    
-    Ok(signature)
+/// Recover an rsig from a signature under a known key by trial/error.
+fn sig_from_digest_bytes_trial_recovery(
+    sig: k256::ecdsa::Signature,
+    hash: &B256,
+    pubkey: &VerifyingKey,
+) -> Signature {
+    let signature = Signature::from_signature_and_parity(sig, false);
+    if check_candidate(&signature, hash, pubkey) {
+        return signature;
+    }
+
+    let signature = signature.with_parity(true);
+    if check_candidate(&signature, hash, pubkey) {
+        return signature;
+    }
+
+    panic!("bad sig");
+}
+
+/// Makes a trial recovery to check whether an RSig corresponds to a known `VerifyingKey`.
+fn check_candidate(signature: &Signature, hash: &B256, pubkey: &VerifyingKey) -> bool {
+    signature
+        .recover_from_prehash(hash)
+        .map(|key| key == *pubkey)
+        .unwrap_or(false)
+}
+
+/// Decode an Stronghold Signature response.
+fn decode_signature(
+    raw: [u8; RecoverableSignature::LENGTH],
+) -> Result<k256::ecdsa::Signature, StrongholdSignerError> {
+    let sig = k256::ecdsa::Signature::from_der(&raw[..64])?;
+    Ok(sig.normalize_s().unwrap_or(sig))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy::primitives::{Address as AlloyAddress, Signature};
+    use alloy::primitives::Address;
     use alloy_consensus::{TxEnvelope, TxLegacy};
     use alloy_network::TxSigner;
     use alloy_primitives::{bytes, U256};
     use alloy_signer::Signer;
-    use crypto::signatures::secp256k1_ecdsa::EvmAddress;
-    use k256::ecdsa::{signature::Signer as K256Signer, SigningKey};
-    use std::str::FromStr;
-    use std::{env, fs};
+    use std::env;
 
-    // Helper to setup test environment
-    fn setup_test_env() {
+    // Helper to setup test environment and return a StrongholdSigner
+    fn setup_test_env(chain_id: Option<ChainId>) -> StrongholdSigner {
         env::set_var("PASSPHRASE", "test_passphrase_of_sufficient_length");
+
+        // Create a new signer directly
+        StrongholdSigner::new(chain_id).expect("Failed to create StrongholdSigner")
     }
 
     // Helper to clean up test environment
@@ -276,12 +318,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_initialize_new_signer() {
-        setup_test_env();
+        let signer = setup_test_env(Some(1));
 
-        let signer = StrongholdSigner::new(Some(1));
-        assert!(signer.is_ok(), "Should initialize successfully");
-
-        let signer = signer.unwrap();
         assert!(signer.address != Address::ZERO, "Address should be set");
         assert_eq!(signer.chain_id, Some(1), "Chain ID should match");
 
@@ -290,14 +328,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_reinitialize_existing_signer() {
-        setup_test_env();
-
-        // First creation
-        let signer1 = StrongholdSigner::new(Some(1)).unwrap();
+        let signer1 = setup_test_env(Some(1));
         let address1 = signer1.address;
 
         // Second creation should load same key
-        let signer2 = StrongholdSigner::new(Some(1)).unwrap();
+        let signer2 = setup_test_env(Some(1));
         assert_eq!(signer2.address, address1, "Should load same address");
 
         cleanup_test_env();
@@ -305,11 +340,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_sign_message() {
-        setup_test_env();
+        let signer = setup_test_env(Some(1));
 
-        let signer = StrongholdSigner::new(Some(1)).unwrap();
+        println!("Signer: {:?}", signer);
         let signer_address = alloy_network::TxSigner::address(&signer);
-
+        println!("Signer address: {:?}", signer_address);
         let message = b"hello world";
         let signature = signer
             .sign_message(message)
@@ -327,27 +362,31 @@ mod tests {
 
     #[tokio::test]
     async fn test_sign_hash() {
-        setup_test_env();
+        let signer = setup_test_env(Some(1));
 
-        let signer = StrongholdSigner::new(Some(1)).unwrap();
         let message = alloy::primitives::keccak256(b"hello world");
-        let hash = B256::from(message);
+        let signature = signer
+            .sign_hash(&message)
+            .await
+            .expect("Failed to sign hash");
+        let signer_address = alloy_network::TxSigner::address(&signer);
 
-        let signature = signer.sign_hash(&hash).await;
-        assert!(signature.is_ok(), "Should sign hash successfully");
+        assert!(!signature.r().is_zero(), "r component should be non-zero");
+        assert!(!signature.s().is_zero(), "s component should be non-zero");
 
-        let sig = signature.unwrap();
-        assert!(!sig.r().is_zero(), "r component should be non-zero");
-        assert!(!sig.s().is_zero(), "s component should be non-zero");
-        
+        // Recover address from the signature
+        let recovered = signature
+            .recover_address_from_msg(message)
+            .expect("Failed to recover address");
+        assert_eq!(signer_address, recovered);
+
         cleanup_test_env();
     }
 
     #[tokio::test]
     async fn test_sign_transaction() {
-        setup_test_env();
+        let signer = setup_test_env(Some(1));
 
-        let signer = StrongholdSigner::new(Some(1)).unwrap();
         let to = "deaddeaddeaddeaddeaddeaddeaddeaddeaddead";
         let to: Address = to.parse().unwrap();
 
@@ -372,9 +411,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_evm_address() {
-        setup_test_env();
+        let signer = setup_test_env(Some(1));
 
-        let signer = StrongholdSigner::new(Some(1)).unwrap();
         let tx_signer_addr: Address = TxSigner::address(&signer);
 
         assert_ne!(tx_signer_addr, Address::ZERO, "Address should not be zero");
@@ -391,9 +429,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_chain_id_management() {
-        setup_test_env();
+        let mut signer = setup_test_env(Some(1));
 
-        let mut signer = StrongholdSigner::new(Some(1)).unwrap();
         assert_eq!(signer.chain_id(), Some(1));
 
         signer.set_chain_id(Some(5));
@@ -415,9 +452,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_signer_trait_implementation() {
-        setup_test_env();
-
-        let signer = StrongholdSigner::new(Some(1)).unwrap();
+        let signer = setup_test_env(Some(1));
 
         // Test address method
         let address: Address = TxSigner::address(&signer);
@@ -436,10 +471,8 @@ mod tests {
         use alloy::providers::{ext::AnvilApi, Provider, ProviderBuilder};
         use alloy_primitives::U256;
 
-        setup_test_env();
+        let signer = setup_test_env(Some(1));
 
-        // Create signer (chain_id 1 to match Anvil's default)
-        let signer = StrongholdSigner::new(Some(1)).expect("Failed to create signer");
         let sender_address: Address = TxSigner::address(&signer);
         let wallet = EthereumWallet::from(signer.clone());
         println!("Signer        : {:?}", signer);
