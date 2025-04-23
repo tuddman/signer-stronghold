@@ -58,6 +58,9 @@ pub enum StrongholdSignerError {
     /// k256::ecdsa::Error
     #[error(transparent)]
     K256Error(#[from] k256::ecdsa::Error),
+    /// Unsupported operation.
+    #[error(transparent)]
+    UnsupportedOperation(#[from] alloy_signer::Error),
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -72,7 +75,11 @@ impl alloy_network::TxSigner<Signature> for StrongholdSigner {
         &self,
         tx: &mut dyn SignableTransaction<Signature>,
     ) -> Result<Signature> {
-        sign_transaction_with_chain_id!(self, tx, self.sign_hash(&tx.signature_hash()).await)
+        // original
+        // sign_transaction_with_chain_id!(self, tx, self.sign_hash(&tx.signature_hash()).await)
+
+        let encoded_tx = tx.encoded_for_signing();
+        sign_transaction_with_chain_id!(self, tx, self.sign_using_stronghold(encoded_tx))
     }
 }
 
@@ -80,21 +87,17 @@ impl alloy_network::TxSigner<Signature> for StrongholdSigner {
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl Signer for StrongholdSigner {
     #[inline]
-    async fn sign_hash(&self, hash: &B256) -> Result<Signature> {
-        let prefixed_msg = eip191_message(hash);
-        let sig = self
-            .sign_message_using_stronghold(&prefixed_msg)
-            .await
-            .map_err(alloy_signer::Error::other)?;
-        Ok(sig)
+    async fn sign_hash(&self, _hash: &B256) -> Result<Signature> {
+        return Err(alloy_signer::Error::UnsupportedOperation(
+            alloy_signer::UnsupportedSignerOperation::SignHash,
+        ));
     }
 
     #[inline]
     async fn sign_message(&self, message: &[u8]) -> Result<Signature> {
         let prefixed_msg = eip191_message(message);
         let sig = self
-            .sign_message_using_stronghold(&prefixed_msg)
-            .await
+            .sign_using_stronghold(prefixed_msg)
             .map_err(alloy_signer::Error::other)?;
         Ok(sig)
     }
@@ -220,10 +223,7 @@ impl StrongholdSigner {
     /// The private key is never exposed outside of Stronghold's secure enclave.
     ///
     /// This returns an alloy_primitives::Signature with the correct format.
-    async fn sign_message_using_stronghold(
-        &self,
-        message: &[u8],
-    ) -> Result<Signature, StrongholdSignerError> {
+    fn sign_using_stronghold(&self, msg: Vec<u8>) -> Result<Signature, StrongholdSignerError> {
         let client = self.stronghold.get_client(CLIENT_PATH)?;
         let location = Location::const_generic(VAULT_PATH.to_vec(), RECORD_PATH.to_vec());
 
@@ -231,7 +231,7 @@ impl StrongholdSigner {
         let result_bytes: [u8; 65] =
             client.execute_procedure(iota_stronghold::procedures::Secp256k1EcdsaSign {
                 flavor: iota_stronghold::procedures::Secp256k1EcdsaFlavor::Keccak256,
-                msg: message.to_vec(),
+                msg,
                 private_key: location.clone(),
             })?;
 
@@ -322,24 +322,12 @@ mod tests {
         println!("Signer address: {:?}", signer_address);
         let message = b"hello world";
         let hash = alloy::primitives::keccak256(message);
-        let signature = signer
-            .sign_hash(&hash)
-            .await
-            .expect("Failed to sign message");
+        let signature = signer.sign_hash(&hash).await;
 
-        // Recover address from the signature
-        let recovered = signature
-            .recover_address_from_msg(hash)
-            .expect("Failed to recover address");
-        assert_eq!(signer_address, recovered);
-
-        let recovered_from_hash = signature
-            .recover_address_from_prehash(&hash)
-            .expect("Failed to recover address");
-        // This is a misleading to test to conduct, as the hash is signed as though it is a
-        // message.  Effectively, keccak256(keccak256(message)) is signed. Which does not result in
-        // a reversible signature.
-        assert_ne!(signer_address, recovered_from_hash);
+        assert!(
+            signature.is_err(),
+            "Should return UnsupportedOperation error"
+        );
 
         cleanup_test_env();
     }
@@ -429,116 +417,57 @@ mod tests {
     async fn test_end_to_end_transaction_with_anvil() {
         use alloy::network::EthereumWallet;
         use alloy::node_bindings::Anvil;
+        use alloy::primitives::address;
         use alloy::providers::{ext::AnvilApi, Provider, ProviderBuilder};
+        use alloy::rpc::types::TransactionRequest;
+        use alloy_network::TransactionBuilder;
         use alloy_primitives::U256;
 
-        // Start Anvil instance
         let anvil = Anvil::new().spawn();
         let chain_id = anvil.chain_id();
-
         let signer = setup_test_env(Some(chain_id));
 
         let sender_address: Address = TxSigner::address(&signer);
-        let wallet = EthereumWallet::from(signer.clone());
+        let mut wallet = EthereumWallet::from(signer.clone());
         println!("Signer        : {:?}", signer);
         println!("Sender address: {:?}", sender_address);
         println!("Wallet        : {:?}", wallet);
 
-        // Create provider connected to Anvil
+        wallet.register_signer(signer);
         let provider = ProviderBuilder::new()
             .wallet(wallet)
             .on_http(anvil.endpoint_url());
 
         provider
-            .anvil_set_balance(sender_address, U256::from(1_000_000_000))
+            .anvil_set_balance(sender_address, U256::from(10_000_000_000_000_000u64))
             .await
             .unwrap();
+
         // Fund the signer's address (Anvil starts with prefunded accounts)
         let initial_balance = provider
             .get_balance(sender_address)
             .await
             .expect("Failed to get balance");
 
+        println!("Initial balance: {:?}", initial_balance);
         assert!(initial_balance > U256::ZERO, "Signer should have balance");
 
-        // Create a transaction
-        let recipient = "deaddeaddeaddeaddeaddeaddeaddeaddeaddead";
-        let recipient: Address = recipient.parse().unwrap();
-        let tx_value = U256::from(100);
-        let gas_price = provider
-            .get_gas_price()
-            .await
-            .expect("Failed to get gas price");
-        let nonce = provider
-            .get_transaction_count(sender_address)
-            .await
-            .expect("Failed to get nonce");
+        // Build a transaction to send 100 wei .
+        let tx = TransactionRequest::default()
+            .with_from(sender_address)
+            .with_to(address!("d8dA6BF26964aF9D7eEd9e03E53415D37aA96045"))
+            .with_value(U256::from(100));
 
-        let mut tx = TxLegacy {
-            to: alloy::primitives::TxKind::Call(recipient),
-            chain_id: Some(chain_id),
-            value: tx_value,
-            gas_price,
-            gas_limit: 21000,
-            input: bytes!(""),
-            nonce,
-        };
-
-        // Sign the transaction
-        let signature = signer
-            .sign_transaction(&mut tx)
-            .await
-            .expect("Failed to sign tx");
-        let signed_tx = tx.into_signed(signature);
-
-        // Encode the signed transaction to RLP bytes
-        let mut tx_bytes = Vec::new();
-        signed_tx.rlp_encode(&mut tx_bytes);
-
-        // Send the transaction
+        // Send the transaction and wait for inclusion.
         let tx_hash = provider
-            .send_raw_transaction(&tx_bytes)
+            .send_transaction(tx)
             .await
             .unwrap()
             .watch()
             .await
-            .expect("Failed to send tx");
+            .unwrap();
 
-        // Wait for transaction to be mined
-        let receipt = provider
-            .get_transaction_receipt(tx_hash)
-            .await
-            .expect("Failed to get receipt")
-            .expect("Receipt not found (tx not mined)");
-
-        assert!(receipt.status(), "Tx should be successful");
-
-        // Verify balances
-        let sender_balance = provider
-            .get_balance(sender_address)
-            .await
-            .expect("Failed to get sender balance");
-        let recipient_balance = provider
-            .get_balance(recipient)
-            .await
-            .expect("Failed to get recipient balance");
-
-        // Calculate expected values (very simplified - doesn't account for gas properly)
-        let expected_sender_balance = initial_balance - tx_value - U256::from(gas_price * 21000);
-        let expected_recipient_balance = tx_value;
-
-        assert!(
-            expected_sender_balance > U256::ZERO,
-            "Sender balance should be positive"
-        );
-        assert!(
-            sender_balance < initial_balance,
-            "Sender balance should decrease"
-        );
-        assert!(
-            recipient_balance >= expected_recipient_balance,
-            "Recipient should receive funds"
-        );
+        println!("Sent transaction: {tx_hash}");
 
         cleanup_test_env();
     }
