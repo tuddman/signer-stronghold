@@ -75,11 +75,11 @@ impl alloy_network::TxSigner<Signature> for StrongholdSigner {
         &self,
         tx: &mut dyn SignableTransaction<Signature>,
     ) -> Result<Signature> {
-        // original
-        // sign_transaction_with_chain_id!(self, tx, self.sign_hash(&tx.signature_hash()).await)
-
-        let encoded_tx = tx.encoded_for_signing();
-        sign_transaction_with_chain_id!(self, tx, self.sign_using_stronghold(encoded_tx))
+        sign_transaction_with_chain_id!(
+            self,
+            tx,
+            self.sign_using_stronghold(tx.encoded_for_signing())
+        )
     }
 }
 
@@ -127,6 +127,7 @@ impl StrongholdSigner {
     /// This passphrase should be treated with the same level of security as a private key.
     ///
     /// If the stronghold snapshot file doesn't exist, it will create a new key.
+    ///
     pub fn new(chain_id: Option<ChainId>) -> Result<Self, StrongholdSignerError> {
         let passphrase = std::env::var("PASSPHRASE")?.as_bytes().to_vec();
 
@@ -223,6 +224,7 @@ impl StrongholdSigner {
     /// The private key is never exposed outside of Stronghold's secure enclave.
     ///
     /// This returns an alloy_primitives::Signature with the correct format.
+    ///
     fn sign_using_stronghold(&self, msg: Vec<u8>) -> Result<Signature, StrongholdSignerError> {
         let client = self.stronghold.get_client(CLIENT_PATH)?;
         let location = Location::const_generic(VAULT_PATH.to_vec(), RECORD_PATH.to_vec());
@@ -295,9 +297,7 @@ mod tests {
     async fn test_sign_message() {
         let signer = setup_test_env(Some(1));
 
-        println!("Signer: {:?}", signer);
         let signer_address = alloy_network::TxSigner::address(&signer);
-        println!("Signer address: {:?}", signer_address);
         let message = b"hello world";
         let signature = signer
             .sign_message(message)
@@ -317,9 +317,7 @@ mod tests {
     async fn test_sign_hash() {
         let signer = setup_test_env(Some(1));
 
-        println!("Signer: {:?}", signer);
         let signer_address = alloy_network::TxSigner::address(&signer);
-        println!("Signer address: {:?}", signer_address);
         let message = b"hello world";
         let hash = alloy::primitives::keccak256(message);
         let signature = signer.sign_hash(&hash).await;
@@ -429,28 +427,17 @@ mod tests {
 
         let sender_address: Address = TxSigner::address(&signer);
         let mut wallet = EthereumWallet::from(signer.clone());
-        println!("Signer        : {:?}", signer);
-        println!("Sender address: {:?}", sender_address);
-        println!("Wallet        : {:?}", wallet);
-
         wallet.register_signer(signer);
+
         let provider = ProviderBuilder::new()
             .wallet(wallet)
             .on_http(anvil.endpoint_url());
 
+        // Fund the signer's address (Anvil starts with prefunded accounts)
         provider
             .anvil_set_balance(sender_address, U256::from(10_000_000_000_000_000u64))
             .await
             .unwrap();
-
-        // Fund the signer's address (Anvil starts with prefunded accounts)
-        let initial_balance = provider
-            .get_balance(sender_address)
-            .await
-            .expect("Failed to get balance");
-
-        println!("Initial balance: {:?}", initial_balance);
-        assert!(initial_balance > U256::ZERO, "Signer should have balance");
 
         // Build a transaction to send 100 wei .
         let tx = TransactionRequest::default()
