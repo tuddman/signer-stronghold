@@ -45,7 +45,7 @@ use signer_stronghold::StrongholdSigner;
 use std::path::PathBuf;
 
 let chain_id = Some(1);
-let custom_path = PathBuf::from("my_custom_stronghold.stronghold");
+let custom_path = PathBuf::from("/path/to/my_custom.stronghold");
 let signer = StrongholdSigner::new_from_path(custom_path, chain_id).unwrap();
 
 // Use signer just like the default one

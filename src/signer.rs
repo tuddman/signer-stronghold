@@ -131,7 +131,7 @@ impl StrongholdSigner {
     ///
     pub fn new(chain_id: Option<ChainId>) -> Result<Self, StrongholdSignerError> {
         let passphrase = std::env::var("PASSPHRASE")?.as_bytes().to_vec();
-        Self::initialize(STRONGHOLD_PATH.into(), passphrase, chain_id)
+        Self::initialize(&STRONGHOLD_PATH.into(), passphrase, chain_id)
     }
 
     /// Create a new StrongholdSigner with a custom path and an optional chain ID.
@@ -146,18 +146,18 @@ impl StrongholdSigner {
         chain_id: Option<ChainId>,
     ) -> Result<Self, StrongholdSignerError> {
         let passphrase = std::env::var("PASSPHRASE")?.as_bytes().to_vec();
-        Self::initialize(stronghold_path, passphrase, chain_id)
+        Self::initialize(&stronghold_path, passphrase, chain_id)
     }
 
     /// Helper method to initialize a StrongholdSigner with the given path, passphrase, and chain ID.
     fn initialize(
-        stronghold_path: PathBuf,
+        stronghold_path: &PathBuf,
         passphrase: Vec<u8>,
         chain_id: Option<ChainId>,
     ) -> Result<Self, StrongholdSignerError> {
-        let snapshot_path = SnapshotPath::from_path(&stronghold_path);
         let key_provider = KeyProvider::with_passphrase_hashed_blake2b(passphrase)?;
         let stronghold = Stronghold::default();
+        let snapshot_path = SnapshotPath::from_path(stronghold_path);
 
         let init_result =
             stronghold.load_client_from_snapshot(CLIENT_PATH, &key_provider, &snapshot_path);
@@ -170,7 +170,7 @@ impl StrongholdSigner {
                     &stronghold,
                     &key_provider,
                     KeyType::Secp256k1Ecdsa,
-                    stronghold_path,
+                    stronghold_path.to_path_buf(),
                 )?;
 
                 stronghold.commit_with_keyprovider(&snapshot_path, &key_provider)?;
