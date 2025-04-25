@@ -1,4 +1,5 @@
 use std::fmt;
+use std::path::PathBuf;
 
 use alloy_consensus::SignableTransaction;
 use alloy_primitives::{hex, utils::eip191_message, Address, ChainId, Signature, B256};
@@ -130,8 +131,31 @@ impl StrongholdSigner {
     ///
     pub fn new(chain_id: Option<ChainId>) -> Result<Self, StrongholdSignerError> {
         let passphrase = std::env::var("PASSPHRASE")?.as_bytes().to_vec();
+        Self::initialize(STRONGHOLD_PATH.into(), passphrase, chain_id)
+    }
 
-        let snapshot_path = SnapshotPath::from_path(STRONGHOLD_PATH);
+    /// Create a new StrongholdSigner with a custom path and an optional chain ID.
+    ///
+    /// This will read the passphrase from the `PASSPHRASE` environment variable.
+    /// This passphrase should be treated with the same level of security as a private key.
+    ///
+    /// If the stronghold snapshot file doesn't exist, it will create a new key.
+    ///
+    pub fn new_from_path(
+        stronghold_path: PathBuf,
+        chain_id: Option<ChainId>,
+    ) -> Result<Self, StrongholdSignerError> {
+        let passphrase = std::env::var("PASSPHRASE")?.as_bytes().to_vec();
+        Self::initialize(stronghold_path, passphrase, chain_id)
+    }
+
+    /// Helper method to initialize a StrongholdSigner with the given path, passphrase, and chain ID.
+    fn initialize(
+        stronghold_path: PathBuf,
+        passphrase: Vec<u8>,
+        chain_id: Option<ChainId>,
+    ) -> Result<Self, StrongholdSignerError> {
+        let snapshot_path = SnapshotPath::from_path(&stronghold_path);
         let key_provider = KeyProvider::with_passphrase_hashed_blake2b(passphrase)?;
         let stronghold = Stronghold::default();
 
@@ -142,7 +166,12 @@ impl StrongholdSigner {
             Err(iota_stronghold::ClientError::SnapshotFileMissing(_)) => {
                 // No snapshot file exists, create a new client and key
                 stronghold.create_client(CLIENT_PATH)?;
-                Self::maybe_generate_key(&stronghold, &key_provider, KeyType::Secp256k1Ecdsa)?;
+                Self::maybe_generate_key(
+                    &stronghold,
+                    &key_provider,
+                    KeyType::Secp256k1Ecdsa,
+                    stronghold_path,
+                )?;
 
                 stronghold.commit_with_keyprovider(&snapshot_path, &key_provider)?;
                 Self::get_evm_address(&stronghold)?
@@ -167,6 +196,7 @@ impl StrongholdSigner {
         stronghold: Stronghold,
         chain_id: Option<ChainId>,
     ) -> Result<Self, StrongholdSignerError> {
+        stronghold.get_client(CLIENT_PATH)?;
         let address = Self::get_evm_address(&stronghold)?;
         Ok(Self {
             address,
@@ -180,6 +210,7 @@ impl StrongholdSigner {
         stronghold: &Stronghold,
         key_provider: &KeyProvider,
         ty: KeyType,
+        stronghold_path: PathBuf,
     ) -> Result<(), StrongholdSignerError> {
         let output = Location::const_generic(VAULT_PATH.to_vec(), RECORD_PATH.to_vec());
 
@@ -193,7 +224,7 @@ impl StrongholdSigner {
                 let generate_key_procedure =
                     iota_stronghold::procedures::GenerateKey { ty, output };
                 client.execute_procedure(generate_key_procedure)?;
-                let snapshot_path = SnapshotPath::from_path(STRONGHOLD_PATH);
+                let snapshot_path = SnapshotPath::from_path(stronghold_path);
                 stronghold.commit_with_keyprovider(&snapshot_path, key_provider)?;
             }
             Ok(_) => unreachable!(),
@@ -202,7 +233,7 @@ impl StrongholdSigner {
                 let generate_key_procedure =
                     iota_stronghold::procedures::GenerateKey { ty, output };
                 client.execute_procedure(generate_key_procedure)?;
-                let snapshot_path = SnapshotPath::from_path(STRONGHOLD_PATH);
+                let snapshot_path = SnapshotPath::from_path(stronghold_path);
                 stronghold.commit_with_keyprovider(&snapshot_path, key_provider)?;
             }
         }
@@ -257,6 +288,7 @@ mod tests {
     use alloy_primitives::{bytes, U256};
     use alloy_signer::Signer;
     use std::env;
+    use std::fs;
 
     // Helper to setup test environment and return a StrongholdSigner
     fn setup_test_env(chain_id: Option<ChainId>) -> StrongholdSigner {
@@ -269,6 +301,19 @@ mod tests {
     // Helper to clean up test environment
     fn cleanup_test_env() {
         env::remove_var("PASSPHRASE");
+    }
+
+    // Helper to setup test environment with a specific path and return a StrongholdSigner
+    fn setup_test_env_with_path(path: PathBuf, chain_id: Option<ChainId>) -> StrongholdSigner {
+        env::set_var("PASSPHRASE", "test_passphrase_of_sufficient_length");
+
+        // Remove the file if it exists
+        if path.exists() {
+            fs::remove_file(&path).expect("Failed to remove existing file");
+        }
+
+        // Create a new signer with the specified path
+        StrongholdSigner::new_from_path(path, chain_id).expect("Failed to create StrongholdSigner")
     }
 
     #[tokio::test]
@@ -317,7 +362,6 @@ mod tests {
     async fn test_sign_hash() {
         let signer = setup_test_env(Some(1));
 
-        let signer_address = alloy_network::TxSigner::address(&signer);
         let message = b"hello world";
         let hash = alloy::primitives::keccak256(message);
         let signature = signer.sign_hash(&hash).await;
@@ -361,7 +405,6 @@ mod tests {
         let signer = setup_test_env(Some(1));
 
         let tx_signer_addr: Address = TxSigner::address(&signer);
-
         assert_ne!(tx_signer_addr, Address::ZERO, "Address should not be zero");
         assert_eq!(tx_signer_addr.len(), 20, "Address should be 20 bytes");
 
@@ -456,6 +499,27 @@ mod tests {
 
         println!("Sent transaction: {tx_hash}");
 
+        cleanup_test_env();
+    }
+
+    #[tokio::test]
+    async fn test_new_from_path() {
+        let test_path = PathBuf::from("test_signer.stronghold");
+        let signer = setup_test_env_with_path(test_path.clone(), Some(1));
+
+        assert!(signer.address != Address::ZERO, "Address should be set");
+        assert_eq!(signer.chain_id, Some(1), "Chain ID should match");
+
+        // Verify the file was created
+        assert!(test_path.exists(), "Stronghold file should exist");
+
+        // Create a second signer with the same path to verify it loads the same key
+        let signer2 = StrongholdSigner::new_from_path(test_path.clone(), Some(1))
+            .expect("Failed to create second StrongholdSigner");
+        assert_eq!(signer2.address, signer.address, "Should load same address");
+
+        // Clean up
+        fs::remove_file(&test_path).expect("Failed to remove test file");
         cleanup_test_env();
     }
 }
