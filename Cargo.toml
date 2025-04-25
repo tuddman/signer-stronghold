@@ -2,6 +2,10 @@
 name = "signer-stronghold"
 version = "0.1.0"
 edition = "2021"
+description = "An Ethereum signer for a Stronghold"
+repository = "https://github.com/tuddman/signer-stronghold"
+license-file= "LICENSE-MIT"
+
 
 [dependencies]
 alloy-consensus = "0.14.0"
