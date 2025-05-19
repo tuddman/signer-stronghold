@@ -16,9 +16,9 @@ const RECORD_PATH: &[u8] = b"record-path-0";
 ///
 #[derive(Clone)]
 pub struct StrongholdSigner {
-    address: Address,
-    chain_id: Option<ChainId>,
-    stronghold: iota_stronghold::Stronghold,
+    pub address: Address,
+    pub chain_id: Option<ChainId>,
+    pub stronghold: iota_stronghold::Stronghold,
 }
 
 impl fmt::Debug for StrongholdSigner {
@@ -203,6 +203,11 @@ impl StrongholdSigner {
             chain_id,
             stronghold,
         })
+    }
+
+    /// Returns the Stronghold instance.
+    pub fn stronghold(&self) -> Stronghold {
+        self.stronghold.clone()
     }
 
     /// Creates a key if it doesn't already exist in the stronghold vault
@@ -474,7 +479,7 @@ mod tests {
 
         let provider = ProviderBuilder::new()
             .wallet(wallet)
-            .on_http(anvil.endpoint_url());
+            .connect_http(anvil.endpoint_url());
 
         // Fund the signer's address (Anvil starts with prefunded accounts)
         provider
