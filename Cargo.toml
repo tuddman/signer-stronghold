@@ -1,6 +1,6 @@
 [package]
 name = "signer-stronghold"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "An Ethereum signer for a Stronghold"
 repository = "https://github.com/tuddman/signer-stronghold"

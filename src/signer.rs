@@ -16,8 +16,8 @@ const RECORD_PATH: &[u8] = b"record-path-0";
 ///
 #[derive(Clone)]
 pub struct StrongholdSigner {
-    pub address: Address,
-    pub chain_id: Option<ChainId>,
+    address: Address,
+    chain_id: Option<ChainId>,
     pub stronghold: iota_stronghold::Stronghold,
 }
 
